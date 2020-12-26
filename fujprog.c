@@ -917,7 +917,10 @@ setup_usb(void)
 
 #ifdef __APPLE__
 	uid_t uid=getuid(), euid=geteuid();
-	if (uid<0 || uid!=euid) {
+	if (uid<=0 || uid!=euid) {
+		if (!quiet) {
+			fprintf(stderr, "elevated/root permissions detected, handling kexts\n");
+		}
 		setuid(0);
 		system("/sbin/kextunload"
 		    " -bundle-id com.FTDI.driver.FTDIUSBSerialDriver");
@@ -2678,6 +2681,10 @@ exec_bit_file(char *path, int jed_target, int debug)
 		buf_sprintf(op, "SDR	16	TDI(68FE);\n");
 		buf_sprintf(op, "RUNTEST IDLE	32 TCK;\n\n");
 
+		/* Software reset RSTEN 66h RST 99h (both invariant under bit-reverse) */
+		buf_sprintf(op, "SDR	8	tdi(66);\n");
+		buf_sprintf(op, "SDR	8	tdi(99);\n");
+
 		/* Erase sectors */
 		printf("Erasing sectors, please wait.\n");
 		for (i = 0; i < flen; i += SPI_SECTOR_SIZE) {
@@ -2813,7 +2820,7 @@ exec_bit_file(char *path, int jed_target, int debug)
  * and then call exec_svf_mem().
  */
 static int
-exec_svf_file(char *path, int debug)
+exec_svf_file(char *path, int target, int debug)
 {
 	char *linebuf, *fbuf;
 	FILE *fd;
@@ -2821,6 +2828,11 @@ exec_svf_file(char *path, int debug)
 	int lines_tot = 1;
 	int res;
 	size_t i, slen;
+
+	if (target != JED_TGT_SRAM) {
+		fprintf(stderr, "Unsupported target: svf files can only be written to SRAM (for now)\n");
+		return (EXIT_FAILURE);
+	}
 
 	if (path == NULL) {
 		fbuf=read_stdin(&slen);
@@ -3147,7 +3159,7 @@ prog(char *fname, int target, int debug)
 		    (strcasecmp(&fname[c], ".img") == 0 && target == JED_TGT_FLASH))
 			res = exec_bit_file(fname, target, debug);
 		else if (strcasecmp(&fname[c], ".svf") == 0)
-			res = exec_svf_file(fname, debug);
+			res = exec_svf_file(fname, target, debug);
 		else {
 			/* Execute flash target automatically */
 			if (!quiet) {
@@ -3167,7 +3179,7 @@ prog(char *fname, int target, int debug)
 				res = exec_bit_file(fname, target, debug);
 				break;
 			case TYPE_SVF:
-				res = exec_svf_file(fname, debug);
+				res = exec_svf_file(fname, target, debug);
 				break;
 			case TYPE_UNSPECIFIED:
 				if (fname == NULL) {
@@ -4212,6 +4224,10 @@ term_emul(void)
 					reload = 1;
 					res = 0;
 					goto done;
+				case 'a':
+					txbuf[tx_cnt] = c = 1;
+					break;
+				case 'k':
 				case '.':
 					res = 1;
 					goto done;
@@ -4271,6 +4287,14 @@ term_emul(void)
 					break;
 				}
 			}
+			if (c == 1) {
+				if (key_phase < 2) {
+					key_phase = 2;
+					continue;
+				} else {
+					key_phase = 0;
+				}
+			}
 			if (key_phase == 1 && c == '~') {
 				key_phase = 2;
 				continue;
@@ -4288,7 +4312,11 @@ term_emul(void)
 #ifdef WIN32
 				FT_Write(ftHandle, txbuf, tx_cnt, &sent);
 #else
-				sent = ftdi_write_data(&fc, txbuf, tx_cnt);
+				sent = 0;
+				for(int i=0; i<tx_cnt; i++) {
+					sent += ftdi_write_data(&fc, txbuf+i, 1);
+					ms_sleep(txfu_ms);
+				}
 #endif
 			} else {/* cable_hw == CABLE_HW_COM */
 #ifdef WIN32
@@ -4296,7 +4324,11 @@ term_emul(void)
 				    (DWORD *) &sent, NULL);
 #else
 				fcntl(com_port, F_SETFL, 0);
-				sent = write(com_port, txbuf, tx_cnt);
+				sent = 0;
+				for(int i=0; i<tx_cnt; i++) {
+					sent += write(com_port, txbuf+i, 1);
+					ms_sleep(txfu_ms);
+				}
 				fcntl(com_port, F_SETFL, O_NONBLOCK);
 #endif
 			}
@@ -4478,6 +4510,7 @@ main(int argc, char *argv[])
 	COMMTIMEOUTS com_to;
 #endif
 	force_prog=0;
+	serial = NULL;
 
 #ifndef USE_PPI
 #define OPTS	"VQtdzhij:l:T:b:p:x:p:P:a:e:f:D:rs:S:q::?"
@@ -4652,7 +4685,7 @@ main(int argc, char *argv[])
 
 	if (com_name && cable_hw != CABLE_HW_COM) {
 		fprintf(stderr, "error: "
-		    "options -P and -c are mutualy exclusive\n");
+		    "options -P and -c are mutually exclusive\n");
 		exit(EXIT_FAILURE);
 	}
 
